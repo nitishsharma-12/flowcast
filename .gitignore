@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# Database — do not commit real data
+backend/mrp.db
+backend/metabase.db
+
+# Metabase — jar too large for GitHub, plus local db/state
+metabase.jar
+metabase.db.mv.db
+metabase.db.trace.db
+plugins/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Mac
+.DS_Store
+
+# Environment variables
+.env
+*.env
