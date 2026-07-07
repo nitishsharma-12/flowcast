@@ -14,6 +14,7 @@ from typing import Optional
 
 import httpx
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -40,6 +41,8 @@ from database import (
     get_db_display_url,
     is_readonly_query,
 )
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
