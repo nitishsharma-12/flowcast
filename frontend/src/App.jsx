@@ -3209,6 +3209,18 @@ export default function App() {
 
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
+  // Keep the deployed backend awake while the app is open.
+  useEffect(() => {
+    const keepAlive = () => {
+      fetch(`${apiUrl}/health`).catch(() => {})
+    }
+
+    keepAlive()
+    const interval = setInterval(keepAlive, 10 * 60 * 1000)
+
+    return () => clearInterval(interval)
+  }, [apiUrl])
+
   const clearLocalData = useCallback(() => {
     setHasData(false)
     setSummary(null)

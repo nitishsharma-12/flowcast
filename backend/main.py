@@ -132,6 +132,11 @@ app.add_middleware(
 )
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 class ChatRequest(BaseModel):
     message: str
     api_key: Optional[str] = None
