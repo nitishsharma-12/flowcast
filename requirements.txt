@@ -1,3 +1,0 @@
-# Helps Railway/Nixpacks detect Python at the repo root
-# Actual packages live in backend/requirements.txt
--r backend/requirements.txt
