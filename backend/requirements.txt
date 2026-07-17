@@ -4,7 +4,9 @@ openpyxl
 pandas
 sqlalchemy
 python-multipart
+python-dotenv
+statsmodels
+numpy
 httpx
 watchdog
 psycopg2-binary
-python-dotenv

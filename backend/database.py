@@ -63,6 +63,32 @@ class Item(Base):
     unit = Column(String)
     unit_cost = Column(Float)
     available_qty = Column(Float, default=0)
+    category = Column(String)
+    bom_level = Column(Integer)
+
+
+class SalesHistory(Base):
+    __tablename__ = "sales_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_id = Column(String)
+    item_name = Column(String)
+    week_offset = Column(Integer)
+    actual_sales = Column(Float)
+    week_label = Column(String)
+
+
+class ForecastMeta(Base):
+    __tablename__ = "forecast_meta"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_id = Column(String)
+    method = Column(String)
+    applied_at = Column(String, nullable=True)
+    mape = Column(Float, nullable=True)
+    mad = Column(Float, nullable=True)
+    bias = Column(Float, nullable=True)
+    forecast_json = Column(String, nullable=True)
+    overrides_json = Column(String, nullable=True)
+    active = Column(Integer, default=0)
 
 
 class OpenPO(Base):
@@ -93,6 +119,7 @@ class MRPResult(Base):
     release_date = Column(String, nullable=True)
     release_week = Column(String, nullable=True)
     is_overdue = Column(Integer, default=0)
+    fg_production_date = Column(String, nullable=True)
 
 
 def _normalize_postgres_url(url: str) -> str:
@@ -146,7 +173,26 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_database():
     Base.metadata.create_all(bind=engine)
+    _ensure_schema_columns()
     create_sql_views()
+
+
+def _ensure_schema_columns():
+    with engine.begin() as conn:
+        if DB_TYPE == "sqlite":
+            item_cols = {c[1] for c in conn.execute(text("PRAGMA table_info(items)")).fetchall()}
+            if "category" not in item_cols:
+                conn.execute(text("ALTER TABLE items ADD COLUMN category TEXT"))
+            if "bom_level" not in item_cols:
+                conn.execute(text("ALTER TABLE items ADD COLUMN bom_level INTEGER"))
+
+            mrp_cols = {c[1] for c in conn.execute(text("PRAGMA table_info(mrp_results)")).fetchall()}
+            if "fg_production_date" not in mrp_cols:
+                conn.execute(text("ALTER TABLE mrp_results ADD COLUMN fg_production_date TEXT"))
+        else:
+            conn.execute(text("ALTER TABLE items ADD COLUMN IF NOT EXISTS category TEXT"))
+            conn.execute(text("ALTER TABLE items ADD COLUMN IF NOT EXISTS bom_level INTEGER"))
+            conn.execute(text("ALTER TABLE mrp_results ADD COLUMN IF NOT EXISTS fg_production_date TEXT"))
 
 
 def create_sql_views():

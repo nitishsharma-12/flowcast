@@ -12,6 +12,7 @@ ROLE_LABELS = {
     "inventory": "Inventory",
     "demand_forecast": "Demand Forecast",
     "open_pos": "Open POs",
+    "sales_history": "Sales History",
 }
 
 ITEM_ID_ALIASES = [
@@ -119,6 +120,7 @@ REQUIRED_FIELDS = {
     "inventory": ["item_id"],
     "demand_forecast": ["item_id"],
     "open_pos": ["po_number", "item_id", "supplier", "order_qty", "expected_receipt_week", "status"],
+    "sales_history": ["item_id"],
 }
 
 
@@ -176,6 +178,15 @@ _DEMAND_SEQ_PATTERNS = [
     re.compile(r"^month(\d+)$"),
 ]
 
+_HISTORY_SEQ_PATTERNS = [
+    re.compile(r"^w-(\d+)$"),
+    re.compile(r"^w_minus_?(\d+)$"),
+    re.compile(r"^week-(\d+)$"),
+    re.compile(r"^wk-(\d+)$"),
+    re.compile(r"^past(\d+)$"),
+    re.compile(r"^h(\d+)$"),
+]
+
 
 def _looks_like_date(raw: Any) -> bool:
     s = str(raw).strip()
@@ -188,6 +199,94 @@ def _looks_like_date(raw: Any) -> bool:
         r"^\d{2,4}[-\s][A-Za-z]{3,9}$",            # 2024-Jan
     ]
     return any(re.match(p, s) for p in patterns)
+
+
+def detect_history_columns(columns: List[str]) -> List[Tuple[int, int, str]]:
+    """Return ordered list of (position, week_offset_abs, source_column) for historical week columns.
+
+    Supports W-1, W-2 ... W-26 (offset is positive absolute value of the week number).
+    """
+    matches: List[Tuple[int, int, str]] = []
+    for idx, col in enumerate(columns):
+        norm = normalize_col(col)
+        # Preserve hyphen for W-1 patterns before normalize strips it
+        raw_norm = re.sub(r"[^a-z0-9\-]", "", str(col).strip().lower())
+        seq = None
+        for pat in _HISTORY_SEQ_PATTERNS:
+            m = pat.match(raw_norm) or pat.match(norm)
+            if m:
+                seq = int(m.group(1))
+                break
+        # Also accept plain W1..W26 on a Sales History sheet (treated as oldest→newest later)
+        if seq is None:
+            for pat in _DEMAND_SEQ_PATTERNS:
+                m = pat.match(norm)
+                if m:
+                    n = int(m.group(1))
+                    if n >= 1:
+                        seq = n
+                        break
+        if seq is not None and 1 <= seq <= 52:
+            matches.append((idx, seq, str(col)))
+        elif _looks_like_date(col):
+            matches.append((idx, idx + 1, str(col)))
+    return matches
+
+
+def build_history_week_map(columns: List[str]) -> Dict[str, str]:
+    """Map history columns to canonical week labels.
+
+    - Explicit W-1, W-2, … → keep W-N (W-1 = most recent)
+    - Plain W1, W2, … W8 → keep W1..Wn chronologically (W1 = oldest, Wn = most recent)
+      Do not reverse or remap these to W-N labels.
+    """
+    detected = detect_history_columns(columns)
+    if not detected:
+        return {}
+
+    raw_norms = {str(c): re.sub(r"[^a-z0-9\-]", "", str(c).strip().lower()) for c in columns}
+    has_minus = any(re.match(r"^w-\d+$", v) for v in raw_norms.values())
+
+    if has_minus:
+        mapping = {}
+        for _, seq, src in detected:
+            # Only map columns that were actually W-N style
+            src_norm = raw_norms.get(str(src), "")
+            if re.match(r"^w-\d+$", src_norm):
+                mapping[f"W-{seq}"] = src
+        if mapping:
+            return mapping
+
+    # Plain W1..Wn (or positional): W1 = oldest, Wn = most recent — preserve order, do not reverse
+    numbered = [(seq, src) for _, seq, src in detected if seq is not None]
+    if numbered and all(1 <= s <= 52 for s, _ in numbered):
+        # Prefer numeric week order (W1, W2, …) over raw column position
+        numbered_sorted = sorted(numbered, key=lambda x: x[0])
+        # Deduplicate by week number (keep first)
+        seen = set()
+        mapping = {}
+        for seq, src in numbered_sorted:
+            if seq in seen:
+                continue
+            seen.add(seq)
+            mapping[f"W{seq}"] = src
+        return mapping
+
+    # Fallback: left→right = oldest→newest, label W1..Wn
+    ordered = sorted(detected, key=lambda x: x[0])
+    return {f"W{i + 1}": src for i, (_, _, src) in enumerate(ordered)}
+
+
+def history_week_sort_key(label: str) -> Tuple[int, int]:
+    """Sort key so chronological oldest→newest: W1..Wn then, separately, W-N oldest (more negative) first."""
+    text = str(label).strip().upper()
+    m = re.match(r"^W-(\d+)$", text)
+    if m:
+        return (0, -int(m.group(1)))  # W-16 before W-1
+    m = re.match(r"^W(\d+)$", text)
+    if m:
+        return (1, int(m.group(1)))  # W1 before W8
+    return (2, 0)
 
 
 def detect_demand_columns(columns: List[str]) -> List[Tuple[int, Optional[int], str]]:
@@ -264,6 +363,21 @@ def score_sheet_role(columns: List[str], role: str) -> int:
             score += 4
         if "forecast" in text or "demand" in text:
             score += 2
+        # Prefer future weeks over historical W-N columns
+        if any(re.search(r"w-\d+", re.sub(r"[^a-z0-9\-]", "", str(c).lower())) for c in columns):
+            score -= 3
+
+    elif role == "sales_history":
+        hist_cols = detect_history_columns(columns)
+        score += len(hist_cols) * 2
+        if any(k in text for k in ("itemid", "sku", "partnumber", "productid")):
+            score += 3
+        sheet_hint = text  # column text only; sheet name scored separately below
+        if any(k in sheet_hint for k in ("sales", "history", "actual", "historical")):
+            score += 2
+        # Bonus for W-N style columns
+        if any(re.search(r"w-\d+", re.sub(r"[^a-z0-9\-]", "", str(c).lower())) for c in columns):
+            score += 6
 
     elif role == "open_pos":
         if "supplier" in text or "vendor" in text:
@@ -286,8 +400,18 @@ def detect_sheet_roles(sheets: Dict[str, pd.DataFrame]) -> Dict[str, Optional[st
     scores: List[Tuple[int, str, str]] = []
     for sheet_name, df in sheets.items():
         cols = [str(c) for c in df.columns]
+        name_norm = normalize_col(sheet_name)
         for role in roles:
-            scores.append((score_sheet_role(cols, role), role, sheet_name))
+            score = score_sheet_role(cols, role)
+            if role == "sales_history" and any(
+                k in name_norm for k in ("sales", "history", "actual", "historical")
+            ):
+                score += 8
+            if role == "demand_forecast" and any(
+                k in name_norm for k in ("forecast", "demand")
+            ):
+                score += 4
+            scores.append((score, role, sheet_name))
 
     scores.sort(reverse=True)
     for score, role, sheet_name in scores:
@@ -520,6 +644,44 @@ def build_normalized_sheets(sheets: Dict[str, pd.DataFrame], assignments: Dict[s
         result["open_pos"] = pd.DataFrame(columns=[
             "PO_Number", "Item_ID", "Supplier", "Order_Qty", "Expected_Receipt_Week", "Status",
         ])
+        summary(role, ROLE_LABELS[role], None, None, [])
+
+    # ---- Sales History (optional) ----
+    role = "sales_history"
+    sheet_name = assignments.get(role)
+    if sheet_name:
+        df = sheets[sheet_name]
+        available = [str(c) for c in df.columns]
+        item_col = find_column(available, DEMAND_ITEM_ID_FIELDS)
+        hist_map = build_history_week_map(available)
+        fields = [
+            _report_entry("item_id", item_col, True),
+            {
+                "field": "week_columns",
+                "label": "History Week Columns",
+                "found": len(hist_map) > 0,
+                "source_column": ", ".join(hist_map.values()) if hist_map else None,
+                "required": True,
+            },
+        ]
+        if not item_col or len(hist_map) < 1:
+            # Optional sheet — don't block upload, just skip
+            result["sales_history"] = pd.DataFrame(columns=["Item_ID"])
+            summary(role, ROLE_LABELS[role], sheet_name, df, fields)
+        else:
+            out = df.rename(columns={item_col: "Item_ID"})
+            for week, src in hist_map.items():
+                out = out.rename(columns={src: week})
+            # Chronological oldest → newest (W1…Wn or W-16…W-1). Do not reverse.
+            ordered = sorted(hist_map.keys(), key=history_week_sort_key)
+            out = out[["Item_ID"] + ordered]
+            result["sales_history"] = out
+            column_mappings.append({"role": role, "field": "item_id", "source_column": item_col, "canonical": "Item_ID"})
+            for week, src in hist_map.items():
+                column_mappings.append({"role": role, "field": week, "source_column": src, "canonical": week})
+            summary(role, ROLE_LABELS[role], sheet_name, df, fields)
+    else:
+        result["sales_history"] = pd.DataFrame(columns=["Item_ID"])
         summary(role, ROLE_LABELS[role], None, None, [])
 
     ready = len(errors) == 0 and "item_master" in result and "inventory" in result and "demand_forecast" in result

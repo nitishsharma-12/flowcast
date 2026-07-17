@@ -10,7 +10,7 @@ import time
 import threading
 import zipfile
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 import pandas as pd
@@ -26,13 +26,20 @@ from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
 
 from excel_mapper import ExcelParseError, parse_excel, validate_excel
+from forecast_engine import (
+    confidence_bounds,
+    forecast_with_method,
+    holdout_accuracy,
+)
 from database import (
     DB_TYPE,
     DATABASE_URL,
     PG_FALLBACK_REASON,
+    ForecastMeta,
     Item,
     MRPResult,
     OpenPO,
+    SalesHistory,
     SessionLocal,
     SQL_VIEWS,
     VIEW_CREATE_SQL,
@@ -74,10 +81,11 @@ EXPORT_MRP_COLUMNS = [
     "item_id", "item_name", "week", "gross_req", "scheduled_receipts",
     "projected_inventory", "net_req", "planned_order", "safety_stock",
     "stockout_risk", "need_date", "release_date", "release_week", "is_overdue",
+    "fg_production_date",
 ]
 EXPORT_ITEMS_COLUMNS = [
     "item_id", "item_name", "lead_time_weeks", "safety_stock",
-    "lot_size", "unit", "unit_cost", "available_qty",
+    "lot_size", "unit", "unit_cost", "available_qty", "category", "bom_level",
 ]
 EXPORT_POS_COLUMNS = [
     "po_number", "item_id", "supplier", "order_qty", "expected_receipt_week", "status",
@@ -141,6 +149,34 @@ class ScenarioRequest(BaseModel):
     demand_pct_change: Optional[float] = None
     lead_time_delay_weeks: Optional[int] = None
     safety_stock_pct_change: Optional[float] = None
+
+
+class ForecastParams(BaseModel):
+    ma_window: int = 3
+    alpha: float = 0.3
+    beta: float = 0.1
+    trend: str = "add"
+    seasonal: str = "add"
+    seasonal_periods: int = 4
+
+
+class ForecastRequest(BaseModel):
+    item_id: str
+    method: str = "exponential_smoothing"
+    periods: int = 8
+    params: Optional[ForecastParams] = None
+
+
+class ForecastApplyRequest(BaseModel):
+    item_id: str
+    forecast_values: list
+    method: Optional[str] = None
+
+
+class ForecastOverrideRequest(BaseModel):
+    item_id: str
+    week: str
+    value: float
 
 
 def week_index(week: str) -> int:
@@ -287,6 +323,155 @@ def compute_summary_metrics(mrp_rows, items, pos):
     }
 
 
+def classify_item_category(bom_df: pd.DataFrame, item_id: str, item_name: str) -> str:
+    """Classify item by BOM position, with ID/name fallback."""
+    id_upper = str(item_id).strip().upper()
+    name_lower = (item_name or "").lower()
+
+    parents = set()
+    children = set()
+    if bom_df is not None and len(bom_df) > 0:
+        parents = set(bom_df["Parent_Item"].astype(str).str.strip().tolist())
+        children = set(bom_df["Child_Item"].astype(str).str.strip().tolist())
+
+    is_parent = id_upper in parents
+    is_child = id_upper in children
+
+    if is_parent and not is_child:
+        return "Finished Good"
+    if is_parent and is_child:
+        return "Sub-Assembly"
+    if is_child and not is_parent:
+        if id_upper.startswith("PKG") or "packag" in name_lower:
+            return "Packaging"
+        return "Raw Material"
+
+    # Not in BOM — fall back to ID prefix / name patterns
+    if id_upper.startswith(("ELC", "FG")) or id_upper in {"ITM001", "ITM002"}:
+        return "Finished Good"
+    if id_upper.startswith("SUB") or id_upper in {"ITM003", "ITM004"}:
+        return "Sub-Assembly"
+    if id_upper.startswith("PKG") or id_upper in {"ITM008"} or "packag" in name_lower:
+        return "Packaging"
+    if id_upper.startswith("RAW") or id_upper in {"ITM005", "ITM006", "ITM007"}:
+        return "Raw Material"
+
+    if "finished good" in name_lower or "finished goods" in name_lower:
+        return "Finished Good"
+    if "sub-assembly" in name_lower or "sub assembly" in name_lower:
+        return "Sub-Assembly"
+    if "packag" in name_lower:
+        return "Packaging"
+    if "raw material" in name_lower or "raw mat" in name_lower:
+        return "Raw Material"
+
+    return "Raw Material"
+
+
+def category_to_bom_level(category: str) -> int:
+    return {
+        "Finished Good": 0,
+        "Sub-Assembly": 1,
+        "Raw Material": 2,
+        "Packaging": 2,
+    }.get(category, 2)
+
+
+def build_bom_parents(bom_children: dict) -> dict:
+    """Map each child item to list of parent item IDs."""
+    bom_parents = {}
+    for parent_id, child_list in bom_children.items():
+        for child_id, _qty in child_list:
+            bom_parents.setdefault(child_id, [])
+            if parent_id not in bom_parents[child_id]:
+                bom_parents[child_id].append(parent_id)
+    return bom_parents
+
+
+def _parse_plan_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _parent_production_start_dates(item_id: str, week: str, mrp_data: dict, bom_parents: dict) -> list:
+    """Parent production start = parent release date (need date − parent lead time)."""
+    dates = []
+    for parent_id in bom_parents.get(item_id, []):
+        parent_release = mrp_data[parent_id][week].get("release_date")
+        parsed = _parse_plan_date(parent_release)
+        if parsed:
+            dates.append(parsed)
+    return dates
+
+
+def trace_fg_production_date(
+    item_id: str,
+    week: str,
+    mrp_data: dict,
+    bom_parents: dict,
+    items: dict,
+) -> Optional[date]:
+    """Walk BOM up to finished goods and return the earliest FG production start date."""
+    if items[item_id]["bom_level"] == 0:
+        return _parse_plan_date(mrp_data[item_id][week].get("release_date"))
+
+    fg_dates = []
+    for parent_id in bom_parents.get(item_id, []):
+        if items[parent_id]["bom_level"] == 0:
+            parsed = _parse_plan_date(mrp_data[parent_id][week].get("release_date"))
+            if parsed:
+                fg_dates.append(parsed)
+        else:
+            traced = trace_fg_production_date(parent_id, week, mrp_data, bom_parents, items)
+            if traced:
+                fg_dates.append(traced)
+    return min(fg_dates) if fg_dates else None
+
+
+def apply_cascading_release_dates(
+    mrp_data: dict,
+    items: dict,
+    bom_parents: dict,
+    planning_start: date,
+    today: date,
+) -> None:
+    """
+    Cascade need/release dates through the BOM:
+    - Level 0 (FG): need = week start, release = production start
+    - Level 1+: need = parent production start, release = need − own lead time
+    """
+    sorted_ids = sorted(items.keys(), key=lambda x: items[x]["bom_level"])
+
+    for item_id in sorted_ids:
+        bom_level = items[item_id]["bom_level"]
+        lead_time = items[item_id]["lead_time_weeks"]
+
+        for week in WEEKS:
+            data = mrp_data[item_id][week]
+            has_activity = (data.get("planned_order") or 0) > 0 or (data.get("gross_req") or 0) > 0
+            if not has_activity:
+                continue
+
+            if bom_level == 0:
+                need_date_obj = week_to_need_date(week, planning_start)
+            else:
+                parent_starts = _parent_production_start_dates(item_id, week, mrp_data, bom_parents)
+                need_date_obj = min(parent_starts) if parent_starts else week_to_need_date(week, planning_start)
+
+            release_date_obj = need_date_obj - timedelta(days=lead_time * 7)
+            if bom_level == 0:
+                fg_prod = release_date_obj
+            else:
+                fg_prod = trace_fg_production_date(item_id, week, mrp_data, bom_parents, items)
+
+            data["need_date"] = format_plan_date(need_date_obj)
+            data["release_date"] = format_plan_date(release_date_obj)
+            data["release_week"] = date_to_week_bucket(release_date_obj, planning_start)
+            data["is_overdue"] = 1 if release_date_obj < today else 0
+            data["fg_production_date"] = format_plan_date(fg_prod) if fg_prod else None
+
+
 def topological_sort_items(bom_df: pd.DataFrame, all_items: list) -> list:
     children = set(bom_df["Child_Item"].tolist())
     parents = set(bom_df["Parent_Item"].tolist())
@@ -347,6 +532,9 @@ def run_mrp_parsed(parsed: dict, overrides: Optional[dict] = None) -> dict:
     inventory = parsed["inventory"]
     demand_forecast = parsed["demand_forecast"]
     open_pos = parsed["open_pos"]
+    sales_history = parsed.get("sales_history")
+    if sales_history is None:
+        sales_history = pd.DataFrame(columns=["Item_ID"])
 
     override_item = overrides.get("item_id") if overrides else None
     demand_mult = 1 + (overrides.get("demand_pct", 0) / 100) if overrides else 1
@@ -363,6 +551,7 @@ def run_mrp_parsed(parsed: dict, overrides: Optional[dict] = None) -> dict:
         if override_item and item_id == override_item:
             safety_stock = max(0, round(safety_stock * safety_mult, 2))
             lead_time = max(0, lead_time + lead_delta)
+        category = classify_item_category(bom, item_id, str(row["Item_Name"]))
         items[item_id] = {
             "item_id": item_id,
             "item_name": str(row["Item_Name"]),
@@ -372,6 +561,8 @@ def run_mrp_parsed(parsed: dict, overrides: Optional[dict] = None) -> dict:
             "unit": str(row["Unit"]),
             "unit_cost": float(row["Unit_Cost"]),
             "available_qty": available,
+            "category": category,
+            "bom_level": category_to_bom_level(category),
         }
 
     bom_children = {}
@@ -419,6 +610,7 @@ def run_mrp_parsed(parsed: dict, overrides: Optional[dict] = None) -> dict:
                 "release_date": None,
                 "release_week": None,
                 "is_overdue": 0,
+                "fg_production_date": None,
             }
             for w in WEEKS
         }
@@ -449,20 +641,6 @@ def run_mrp_parsed(parsed: dict, overrides: Optional[dict] = None) -> dict:
             projected = prev_inv + sched + planned - gross
             stockout = 1 if projected < items[item_id]["safety_stock"] else 0
 
-            lead_time = items[item_id]["lead_time_weeks"]
-            need_date_obj = week_to_need_date(week, planning_start)
-            need_date = format_plan_date(need_date_obj)
-
-            if planned > 0:
-                release_date_obj = need_date_obj - timedelta(days=lead_time * 7)
-                release_date = format_plan_date(release_date_obj)
-                release_week = date_to_week_bucket(release_date_obj, planning_start)
-                is_overdue = 1 if release_date_obj < today else 0
-            else:
-                release_date = None
-                release_week = None
-                is_overdue = 0
-
             mrp_data[item_id][week] = {
                 "gross_req": round(gross, 2),
                 "scheduled_receipts": round(sched, 2),
@@ -471,19 +649,25 @@ def run_mrp_parsed(parsed: dict, overrides: Optional[dict] = None) -> dict:
                 "planned_order": round(planned, 2),
                 "safety_stock": items[item_id]["safety_stock"],
                 "stockout_risk": stockout,
-                "need_date": need_date,
-                "release_date": release_date,
-                "release_week": release_week,
-                "is_overdue": is_overdue,
+                "need_date": None,
+                "release_date": None,
+                "release_week": None,
+                "is_overdue": 0,
+                "fg_production_date": None,
             }
 
             prev_inv = projected
+
+    bom_parents = build_bom_parents(bom_children)
+    apply_cascading_release_dates(mrp_data, items, bom_parents, planning_start, today)
 
     return {
         "items": items,
         "open_pos": open_pos,
         "mrp_data": mrp_data,
         "planning_start": format_plan_date(planning_start),
+        "sales_history": sales_history,
+        "demand_forecast": demand_forecast,
     }
 
 
@@ -559,6 +743,8 @@ def clear_and_store(result: dict):
         db.execute(text("DELETE FROM mrp_results"))
         db.execute(text("DELETE FROM items"))
         db.execute(text("DELETE FROM open_pos"))
+        db.execute(text("DELETE FROM sales_history"))
+        db.execute(text("DELETE FROM forecast_meta"))
         db.commit()
 
         for item_id, item in result["items"].items():
@@ -575,6 +761,40 @@ def clear_and_store(result: dict):
                     status=str(row["Status"]),
                 )
             )
+
+        sales_df = result.get("sales_history")
+        if sales_df is not None and len(sales_df) > 0:
+            week_cols = [
+                c for c in sales_df.columns
+                if re.match(r"^W-?\d+$", str(c).strip(), re.IGNORECASE)
+            ]
+            for _, row in sales_df.iterrows():
+                item_id = str(row["Item_ID"]).strip()
+                item_name = result["items"].get(item_id, {}).get("item_name", item_id)
+                for col in week_cols:
+                    label = str(col).strip().upper()
+                    try:
+                        if label.startswith("W-"):
+                            # W-16 … W-1 → offsets -16 … -1 (ascending = oldest→newest)
+                            offset = -int(label.split("-")[1])
+                        else:
+                            # W1 … Wn → offsets 1 … n (W1 oldest, Wn most recent)
+                            offset = int(label[1:])
+                    except (IndexError, ValueError):
+                        continue
+                    try:
+                        val = float(row[col])
+                    except (TypeError, ValueError):
+                        val = 0.0
+                    db.add(
+                        SalesHistory(
+                            item_id=item_id,
+                            item_name=item_name,
+                            week_offset=offset,
+                            actual_sales=val,
+                            week_label=label if label.startswith("W") else str(col),
+                        )
+                    )
 
         for item_id, weeks in result["mrp_data"].items():
             item_name = result["items"][item_id]["item_name"]
@@ -595,6 +815,7 @@ def clear_and_store(result: dict):
                         release_date=data["release_date"],
                         release_week=data["release_week"],
                         is_overdue=data["is_overdue"],
+                        fg_production_date=data.get("fg_production_date"),
                     )
                 )
 
@@ -783,6 +1004,8 @@ def clear_data():
         db.execute(text("DELETE FROM mrp_results"))
         db.execute(text("DELETE FROM items"))
         db.execute(text("DELETE FROM open_pos"))
+        db.execute(text("DELETE FROM sales_history"))
+        db.execute(text("DELETE FROM forecast_meta"))
         db.commit()
     finally:
         db.close()
@@ -1045,9 +1268,276 @@ def get_items():
                 "unit": r.unit,
                 "unit_cost": r.unit_cost,
                 "available_qty": r.available_qty,
+                "category": r.category,
+                "bom_level": r.bom_level,
             }
             for r in rows
         ]
+    finally:
+        db.close()
+
+
+def _sales_series_for_item(db, item_id: str) -> Tuple[list, list]:
+    """Return (week_labels oldest→newest, actual values) for an item.
+
+    W1..Wn: W1 oldest, Wn most recent (immediately before forecast).
+    W-N..W-1: more-negative offsets are older.
+    """
+    rows = (
+        db.query(SalesHistory)
+        .filter(SalesHistory.item_id == item_id)
+        .order_by(SalesHistory.week_offset.asc())
+        .all()
+    )
+    labels = [r.week_label for r in rows]
+    values = [float(r.actual_sales or 0) for r in rows]
+    return labels, values
+
+
+@app.get("/sales-history")
+def get_sales_history(item_id: Optional[str] = None):
+    db = SessionLocal()
+    try:
+        q = db.query(SalesHistory)
+        if item_id:
+            q = q.filter(SalesHistory.item_id == item_id)
+        rows = q.order_by(SalesHistory.item_id, SalesHistory.week_offset.asc()).all()
+        return [
+            {
+                "item_id": r.item_id,
+                "item_name": r.item_name,
+                "week_offset": r.week_offset,
+                "week_label": r.week_label,
+                "actual_sales": r.actual_sales,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/forecast/status")
+def get_forecast_status():
+    db = SessionLocal()
+    try:
+        has_history = db.query(SalesHistory).count() > 0
+        active = (
+            db.query(ForecastMeta)
+            .filter(ForecastMeta.active == 1)
+            .order_by(ForecastMeta.id.desc())
+            .first()
+        )
+        return {
+            "has_sales_history": has_history,
+            "forecast_active": bool(active),
+            "method": active.method if active else None,
+            "item_id": active.item_id if active else None,
+            "applied_at": active.applied_at if active else None,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/forecast")
+def run_forecast(req: ForecastRequest):
+    method = req.method
+    allowed = {"moving_average", "exponential_smoothing", "double_exponential", "holt_winters"}
+    if method not in allowed:
+        raise HTTPException(status_code=400, detail=f"method must be one of {sorted(allowed)}")
+
+    db = SessionLocal()
+    try:
+        item = db.query(Item).filter(Item.item_id == req.item_id).first()
+        if not item:
+            raise HTTPException(status_code=404, detail=f"Item {req.item_id} not found")
+
+        labels, values = _sales_series_for_item(db, req.item_id)
+        if len(values) < 4:
+            raise HTTPException(
+                status_code=400,
+                detail="Need at least 4 weeks of sales history to generate a forecast. "
+                "Add a Sales_History sheet to your Excel upload.",
+            )
+
+        params = (req.params.dict() if req.params else {})
+        periods = max(1, min(int(req.periods or 8), 8))
+        try:
+            fc_values = forecast_with_method(values, method, periods=periods, params=params)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Forecast failed: {exc}") from exc
+
+        import numpy as np
+
+        lower, upper = confidence_bounds(fc_values, np.asarray(values, dtype=float))
+        accuracy = holdout_accuracy(values, method, params=params, holdout=min(4, len(values) // 3 or 1))
+
+        # Persist draft forecast meta (not applied yet)
+        draft = ForecastMeta(
+            item_id=req.item_id,
+            method=method,
+            applied_at=None,
+            mape=accuracy["mape"],
+            mad=accuracy["mad"],
+            bias=accuracy["bias"],
+            forecast_json=json.dumps(fc_values),
+            overrides_json=json.dumps({}),
+            active=0,
+        )
+        db.add(draft)
+        db.commit()
+
+        historical = [{"week": labels[i], "actual": values[i]} for i in range(len(values))]
+        forecast = [
+            {
+                "week": WEEKS[i] if i < len(WEEKS) else f"W{i + 1}",
+                "forecast": fc_values[i],
+                "lower": lower[i],
+                "upper": upper[i],
+            }
+            for i in range(len(fc_values))
+        ]
+
+        return {
+            "item_id": req.item_id,
+            "item_name": item.item_name,
+            "method": method,
+            "historical": historical,
+            "forecast": forecast,
+            "accuracy": accuracy,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/forecast/apply")
+def apply_forecast(req: ForecastApplyRequest):
+    global last_excel_content, sync_state
+
+    if not req.forecast_values or len(req.forecast_values) < 1:
+        raise HTTPException(status_code=400, detail="forecast_values required")
+
+    values = [max(0.0, float(v)) for v in req.forecast_values]
+    while len(values) < 8:
+        values.append(values[-1] if values else 0.0)
+    values = values[:8]
+
+    content = last_excel_content
+    if not content:
+        try:
+            content = _get_source_excel_bytes()
+        except HTTPException:
+            raise HTTPException(status_code=400, detail="No source Excel available to re-run MRP")
+
+    parsed = parse_excel(content)
+    demand = parsed["demand_forecast"].copy()
+    item_id = str(req.item_id).strip()
+
+    if "Item_ID" not in demand.columns:
+        raise HTTPException(status_code=400, detail="Demand forecast sheet missing Item_ID")
+
+    mask = demand["Item_ID"].astype(str).str.strip() == item_id
+    if not mask.any():
+        # Insert new demand row for this finished good
+        new_row = {"Item_ID": item_id}
+        for i, w in enumerate(WEEKS):
+            new_row[w] = values[i]
+        demand = pd.concat([demand, pd.DataFrame([new_row])], ignore_index=True)
+    else:
+        for i, w in enumerate(WEEKS):
+            if w not in demand.columns:
+                demand[w] = 0.0
+            demand.loc[mask, w] = values[i]
+
+    parsed["demand_forecast"] = demand
+    result = run_mrp_parsed(parsed)
+    clear_and_store(result)
+    last_excel_content = content
+
+    applied_at = datetime.now(timezone.utc).isoformat()
+    db = SessionLocal()
+    try:
+        db.query(ForecastMeta).update({ForecastMeta.active: 0})
+        meta = ForecastMeta(
+            item_id=item_id,
+            method=req.method or "applied",
+            applied_at=applied_at,
+            mape=None,
+            mad=None,
+            bias=None,
+            forecast_json=json.dumps(values),
+            overrides_json=json.dumps({}),
+            active=1,
+        )
+        db.add(meta)
+        db.commit()
+
+        mrp_rows = db.query(MRPResult).filter(MRPResult.item_id == item_id).all()
+        sync_state["last_updated"] = applied_at
+        sync_state["filename"] = sync_state.get("filename") or "forecast_applied.xlsx"
+
+        return {
+            "status": "success",
+            "message": "Forecast applied — MRP recalculated with new demand plan",
+            "item_id": item_id,
+            "method": req.method,
+            "applied_at": applied_at,
+            "demand": {WEEKS[i]: values[i] for i in range(8)},
+            "mrp_results": [
+                {
+                    "week": r.week,
+                    "gross_req": r.gross_req,
+                    "planned_order": r.planned_order,
+                    "projected_inventory": r.projected_inventory,
+                }
+                for r in mrp_rows
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.post("/forecast/override")
+def override_forecast(req: ForecastOverrideRequest):
+    db = SessionLocal()
+    try:
+        meta = (
+            db.query(ForecastMeta)
+            .filter(ForecastMeta.item_id == req.item_id)
+            .order_by(ForecastMeta.id.desc())
+            .first()
+        )
+        if not meta:
+            raise HTTPException(status_code=404, detail="No forecast found for this item. Generate one first.")
+        overrides = json.loads(meta.overrides_json or "{}")
+        overrides[req.week] = float(req.value)
+        meta.overrides_json = json.dumps(overrides)
+        db.commit()
+        return {"status": "ok", "item_id": req.item_id, "week": req.week, "value": req.value, "overrides": overrides}
+    finally:
+        db.close()
+
+
+@app.get("/forecast/accuracy")
+def get_forecast_accuracy():
+    db = SessionLocal()
+    try:
+        metas = db.query(ForecastMeta).order_by(ForecastMeta.id.desc()).all()
+        seen = set()
+        out = []
+        for m in metas:
+            if m.item_id in seen:
+                continue
+            seen.add(m.item_id)
+            out.append({
+                "item_id": m.item_id,
+                "method": m.method,
+                "mape": m.mape,
+                "mad": m.mad,
+                "bias": m.bias,
+                "active": bool(m.active),
+                "applied_at": m.applied_at,
+            })
+        return out
     finally:
         db.close()
 
@@ -1077,6 +1567,7 @@ def get_mrp_results():
                 "release_date": r.release_date,
                 "release_week": r.release_week,
                 "is_overdue": r.is_overdue,
+                "fg_production_date": r.fg_production_date,
             }
             for r in rows
         ]

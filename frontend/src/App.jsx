@@ -4,10 +4,12 @@ import html2canvas from 'html2canvas'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
+  Area,
   Bar,
   BarChart,
   CartesianGrid,
   Cell,
+  ComposedChart,
   Legend,
   Line,
   LineChart,
@@ -25,6 +27,7 @@ const weekLabel = (w) => `Week ${WEEKS.indexOf(w) + 1}`
 
 const NAV_ITEMS = [
   { id: 'upload', label: 'Upload', icon: 'upload' },
+  { id: 'forecast', label: 'Forecast', icon: 'forecast' },
   { id: 'overview', label: 'Overview', icon: 'overview' },
   { id: 'planning', label: 'Planning View', icon: 'planning' },
   { id: 'purchase-orders', label: 'Purchase Orders', icon: 'orders' },
@@ -34,10 +37,10 @@ const NAV_ITEMS = [
 ]
 
 const ITEM_CATEGORIES = [
-  { label: 'Finished Goods', ids: ['ITM001', 'ITM002'], match: /finished good/i },
-  { label: 'Sub-Assemblies', ids: ['ITM003', 'ITM004'], match: /sub-assembly/i },
-  { label: 'Raw Materials', ids: ['ITM005', 'ITM006', 'ITM007'], match: /raw material/i },
-  { label: 'Packaging', ids: ['ITM008'], match: /packaging/i },
+  { label: 'Finished Good', ids: ['ELC001', 'ELC002', 'ITM001', 'ITM002'], match: /finished good/i },
+  { label: 'Sub-Assembly', ids: ['SUB001', 'SUB002', 'SUB003', 'SUB004', 'ITM003', 'ITM004'], match: /sub-assembly/i },
+  { label: 'Raw Material', ids: ['RAW001', 'RAW002', 'RAW003', 'RAW004', 'RAW005', 'RAW006', 'RAW007', 'ITM005', 'ITM006', 'ITM007'], match: /raw material/i },
+  { label: 'Packaging', ids: ['PKG001', 'PKG002', 'ITM008'], match: /packaging/i },
 ]
 
 const CHART_GREEN = '#34c759'
@@ -97,11 +100,100 @@ function FlowcastLogo() {
 }
 
 function getItemCategory(item) {
+  if (item?.category) return item.category
+  if (!item) return 'Raw Material'
   for (const cat of ITEM_CATEGORIES) {
     if (cat.ids.includes(item.item_id)) return cat.label
     if (item.item_name && cat.match.test(item.item_name)) return cat.label
   }
-  return 'Other'
+  const id = (item.item_id || '').toUpperCase()
+  if (id.startsWith('ELC') || id.startsWith('FG')) return 'Finished Good'
+  if (id.startsWith('SUB')) return 'Sub-Assembly'
+  if (id.startsWith('PKG')) return 'Packaging'
+  if (id.startsWith('RAW')) return 'Raw Material'
+  return 'Raw Material'
+}
+
+function getOrderTypeInfo(category) {
+  switch (category) {
+    case 'Finished Good':
+      return { label: 'Production Order', badgeClass: 'order-type-production' }
+    case 'Sub-Assembly':
+      return { label: 'Work Order', badgeClass: 'order-type-work' }
+    case 'Raw Material':
+    case 'Packaging':
+      return { label: 'Purchase Order', badgeClass: 'order-type-purchase' }
+    default:
+      return { label: 'Purchase Order', badgeClass: 'order-type-purchase' }
+  }
+}
+
+function getCategoryBadgeClass(category) {
+  switch (category) {
+    case 'Finished Good': return 'category-badge-finished'
+    case 'Sub-Assembly': return 'category-badge-subassembly'
+    case 'Raw Material': return 'category-badge-raw'
+    case 'Packaging': return 'category-badge-packaging'
+    default: return 'category-badge-raw'
+  }
+}
+
+function getActionQtyLabel(category) {
+  switch (category) {
+    case 'Finished Good': return 'Units to Produce'
+    case 'Sub-Assembly': return 'Units to Assemble'
+    default: return 'Units to Purchase'
+  }
+}
+
+function getReleaseDateLabel(category) {
+  switch (category) {
+    case 'Finished Good': return 'Production Start Date'
+    case 'Sub-Assembly': return 'Assembly Start Date'
+    default: return 'PO Release Date'
+  }
+}
+
+function getActionRequiredLine(category, w1) {
+  const release = w1.release_date ? fmtPlanDate(w1.release_date) : 'immediately'
+  const need = w1.need_date ? fmtPlanDate(w1.need_date) : null
+  const fgProd = w1.fg_production_date ? fmtPlanDate(w1.fg_production_date) : null
+
+  switch (category) {
+    case 'Finished Good':
+      return `Action required — Start production by ${release}`
+    case 'Sub-Assembly':
+      return `Action required — Must arrive by ${need || release}, release PO by ${release}`
+    case 'Raw Material':
+    case 'Packaging':
+      if (fgProd) {
+        return `Release PO by ${release} — components needed before production starts on ${fgProd}`
+      }
+      return `Release PO by ${release}${need ? ` — must arrive by ${need}` : ''}`
+    default:
+      return `Action required — Release PO by ${release}`
+  }
+}
+
+function formatReleaseDisplay(category, row) {
+  const need = row.need_date ? fmtPlanDateShort(row.need_date) : '—'
+  const release = row.release_date ? fmtPlanDateShort(row.release_date) : '—'
+  if (!row.release_date) return { text: '—', title: '' }
+
+  switch (category) {
+    case 'Finished Good':
+      return { text: release, title: `Production start: ${fmtPlanDate(row.release_date)}` }
+    case 'Sub-Assembly':
+      return {
+        text: release,
+        title: `Must arrive by: ${need}, Release PO by: ${release}`,
+      }
+    default:
+      return {
+        text: release,
+        title: `Must arrive by: ${need}, Release PO by: ${release}`,
+      }
+  }
 }
 
 function filterByItem(rows, itemId, key = 'item_id') {
@@ -230,7 +322,16 @@ function buildPlanningPopoverContent(metric, row, weeklyRows, weekIdx, rowItem) 
     case 'release_by': {
       const needDate = row.need_date ? fmtPlanDateShort(row.need_date) : '—'
       const releaseDate = row.release_date ? fmtPlanDateShort(row.release_date) : '—'
-      formula = `Release Date\n= Need Date − Lead Time\n= ${needDate} − ${leadTime} week${leadTime === 1 ? '' : 's'}\n= ${releaseDate}`
+      const fgProd = row.fg_production_date ? fmtPlanDateShort(row.fg_production_date) : null
+      const category = getItemCategory(rowItem)
+
+      if (category === 'Finished Good') {
+        formula = `Production Start Date\n= Need Date − Lead Time\n= ${needDate} − ${leadTime} week${leadTime === 1 ? '' : 's'}\n= ${releaseDate}`
+      } else if (category === 'Sub-Assembly') {
+        formula = `Cascading Lead Time (Sub-Assembly)\nMust arrive by = Parent production start\n= ${needDate}\nRelease PO by = Need Date − Lead Time\n= ${needDate} − ${leadTime} week${leadTime === 1 ? '' : 's'}\n= ${releaseDate}`
+      } else {
+        formula = `Cascading Lead Time (Raw Material)\nMust arrive by = Parent production start\n= ${needDate}\nRelease PO by = Need Date − Lead Time\n= ${needDate} − ${leadTime} week${leadTime === 1 ? '' : 's'}\n= ${releaseDate}${fgProd ? `\nSupports FG production starting ${fgProd}` : ''}`
+      }
       break
     }
     case 'status': {
@@ -632,6 +733,11 @@ function NavIcon({ type }) {
       <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
         <rect x="1" y="1" width="6" height="6" rx="1" /><rect x="9" y="1" width="6" height="6" rx="1" />
         <rect x="1" y="9" width="6" height="6" rx="1" /><rect x="9" y="9" width="6" height="6" rx="1" />
+      </svg>
+    ),
+    forecast: (
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <path d="M2 12l3.5-3.5 2.5 2.5L14 4" /><path d="M10 4h4v4" />
       </svg>
     ),
     orders: (
@@ -1303,6 +1409,9 @@ function PlanningViewPage({
   const renderPlanningRow = (r, wi, rowItem, weeklyRows, key, showItem = false) => {
     const st = weekStatus(r)
     const rowKey = String(key)
+    const category = getItemCategory(rowItem)
+    const orderType = getOrderTypeInfo(category)
+    const releaseDisplay = formatReleaseDisplay(category, r)
     return (
       <tr key={key} className={getPlanningRowClass(st)}>
         {showItem && <td>{itemMap[r.item_id] || r.item_id}</td>}
@@ -1331,13 +1440,18 @@ function PlanningViewPage({
           onToggle={handlePopoverToggle}
           popoverContent={buildPlanningPopoverContent('to_order', r, weeklyRows, wi, rowItem)}
         />
+        <td>
+          <span className={`order-type-badge ${orderType.badgeClass}`}>{orderType.label}</span>
+        </td>
         <PlanningValueCell
-          value={r.release_date ? fmtPlanDate(r.release_date) : '—'}
+          value={releaseDisplay.text}
           cellKey={`${rowKey}-release_by`}
           isOpen={activePopover?.key === `${rowKey}-release_by`}
           onToggle={handlePopoverToggle}
           popoverContent={buildPlanningPopoverContent('release_by', r, weeklyRows, wi, rowItem)}
-        />
+        >
+          <span title={releaseDisplay.title}>{releaseDisplay.text}</span>
+        </PlanningValueCell>
         <PlanningValueCell
           cellKey={`${rowKey}-status`}
           isOpen={activePopover?.key === `${rowKey}-status`}
@@ -1376,6 +1490,7 @@ function PlanningViewPage({
     })
     const w1 = weeklyRows.find((r) => r.week === 'W1') || {}
     const itemPos = openPos.filter((p) => p.item_id === item.item_id)
+    const itemCategory = getItemCategory(item)
     const w1Action = (w1.net_req || 0) > 0 || (w1.planned_order || 0) > 0
     const w1Explanation = buildW1ActionExplanation(w1, item, weeklyRows)
     const availableStock = Math.round(item.available_qty ?? 0)
@@ -1400,7 +1515,10 @@ function PlanningViewPage({
 
         <div className="card item-header-card">
           <div className="item-badges item-badges-prominent">
-            <span className="info-badge"><strong>{item.item_name}</strong> · {item.item_id}</span>
+            <span className="info-badge">
+              <strong>{item.item_name}</strong> · {item.item_id}
+              <span className={`category-badge ${getCategoryBadgeClass(itemCategory)}`}>{itemCategory}</span>
+            </span>
             <span className="info-badge">Lead time: {item.lead_time_weeks} wk</span>
             <span className="info-badge">Safety stock: {item.safety_stock}</span>
             <span className="info-badge">Lot size: {item.lot_size}</span>
@@ -1429,7 +1547,7 @@ function PlanningViewPage({
               </ClickableValue>
             </div>
             <div>
-              <span className="action-label">What to order this week</span>
+              <span className="action-label">{getActionQtyLabel(itemCategory)}</span>
               <ClickableValue
                 className="action-value"
                 onDrillDown={(e) => openMetric('planned_order', w1, weeklyRows, 0, item, e)}
@@ -1438,18 +1556,25 @@ function PlanningViewPage({
               </ClickableValue>
             </div>
             <div>
-              <span className="action-label">PO release date</span>
+              <span className="action-label">{getReleaseDateLabel(itemCategory)}</span>
               <ClickableValue
                 className="action-value"
                 onDrillDown={(e) => openMetric('release_date', w1, weeklyRows, 0, item, e)}
               >
-                {w1.release_date || '—'}
+                {w1.release_date ? fmtPlanDate(w1.release_date) : '—'}
               </ClickableValue>
+              {w1.release_date && (
+                <span className="action-date-hint" title={formatReleaseDisplay(itemCategory, w1).title}>
+                  {itemCategory === 'Finished Good'
+                    ? `Production start: ${fmtPlanDateShort(w1.release_date)}`
+                    : `Arrive by ${fmtPlanDateShort(w1.need_date)} · PO by ${fmtPlanDateShort(w1.release_date)}`}
+                </span>
+              )}
             </div>
           </div>
           <p className="action-status-line">
             {w1Action
-              ? `Action required — Release PO by ${w1.release_date || 'immediately'}`
+              ? getActionRequiredLine(itemCategory, w1)
               : 'No action required this week'}
           </p>
           {w1Explanation && (
@@ -1473,7 +1598,8 @@ function PlanningViewPage({
                   <th>Demand</th>
                   <th>Incoming</th>
                   <th>Stock</th>
-                  <th>To Order</th>
+                  <th>Action Qty</th>
+                  <th>Order Type</th>
                   <th>Release By</th>
                   <th>Status</th>
                 </tr>
@@ -1552,6 +1678,10 @@ function PlanningViewPage({
       />
       <div className="planning-viewing-header">{viewingLabel}</div>
 
+      <p className="planning-category-note">
+        Finished goods show production orders. Sub-assemblies show work orders. Raw materials show purchase orders.
+      </p>
+
       <div className="toolbar">
         <button className="btn-secondary" onClick={() => exportCSV(mrpResults, items)}>Export CSV</button>
       </div>
@@ -1567,14 +1697,15 @@ function PlanningViewPage({
                 <th>Demand</th>
                 <th>Incoming</th>
                 <th>Stock</th>
-                <th>To Order</th>
+                <th>Action Qty</th>
+                <th>Order Type</th>
                 <th>Release By</th>
                 <th>Status</th>
               </tr>
             </thead>
             <tbody>
               {mrpResults.length === 0 ? (
-                <tr><td colSpan={9} className="empty-inline">No planning rows to display</td></tr>
+                <tr><td colSpan={10} className="empty-inline">No planning rows to display</td></tr>
               ) : mrpResults.map((r, i) => {
                 const rowItem = itemById[r.item_id]
                 const weeklyRows = getWeeklyRowsForItem(r.item_id, rowItem)
@@ -1655,7 +1786,413 @@ function SupplyCoverageHeatmap({ coverage, itemMap }) {
   )
 }
 
-function OverviewPage({ summary, mrpResults, items, openPos, hasData, onUpload, selectedItemId, onOpenDrilldown, lastUpdated, filename }) {
+function ForecastPage({
+  apiUrl,
+  items,
+  mrpResults,
+  hasData,
+  onUpload,
+  onApplied,
+  onGoPlanning,
+  forecastStatus,
+}) {
+  const finishedGoods = items.filter((i) => getItemCategory(i) === 'Finished Good')
+  const [itemId, setItemId] = useState(finishedGoods[0]?.item_id || '')
+  const [method, setMethod] = useState('exponential_smoothing')
+  const [params, setParams] = useState({
+    ma_window: 3,
+    alpha: 0.3,
+    beta: 0.1,
+    trend: 'add',
+    seasonal: 'add',
+    seasonal_periods: 4,
+  })
+  const [result, setResult] = useState(null)
+  const [overrides, setOverrides] = useState({})
+  const [loading, setLoading] = useState(false)
+  const [applying, setApplying] = useState(false)
+  const [error, setError] = useState('')
+  const [toast, setToast] = useState('')
+  const [hasHistory, setHasHistory] = useState(forecastStatus?.has_sales_history ?? null)
+
+  useEffect(() => {
+    if (!itemId && finishedGoods[0]) setItemId(finishedGoods[0].item_id)
+  }, [finishedGoods, itemId])
+
+  useEffect(() => {
+    if (!hasData) return undefined
+    fetch(`${apiUrl}/forecast/status`)
+      .then((r) => r.json())
+      .then((d) => setHasHistory(!!d.has_sales_history))
+      .catch(() => setHasHistory(false))
+  }, [apiUrl, hasData])
+
+  if (!hasData) return <EmptyState onUpload={onUpload} />
+
+  const selected = items.find((i) => i.item_id === itemId)
+  const currentDemand = WEEKS.map((w) => {
+    const row = mrpResults.find((r) => r.item_id === itemId && r.week === w)
+    return Math.round(row?.gross_req || 0)
+  })
+
+  const methods = [
+    {
+      id: 'moving_average',
+      title: 'Moving Average',
+      best: 'Best for: stable demand',
+      sap: 'SAP equivalent: none',
+    },
+    {
+      id: 'exponential_smoothing',
+      title: 'Exponential Smoothing',
+      best: 'Best for: recent trends',
+      sap: 'SAP equivalent: Standard',
+    },
+    {
+      id: 'double_exponential',
+      title: "Holt's Double",
+      best: 'Best for: trending items',
+      sap: 'SAP equivalent: Trend',
+    },
+    {
+      id: 'holt_winters',
+      title: 'Holt-Winters',
+      best: 'Best for: seasonal items',
+      sap: 'SAP equivalent: Seasonal',
+    },
+  ]
+
+  const generate = async () => {
+    if (!itemId) return
+    setLoading(true)
+    setError('')
+    setToast('')
+    try {
+      const res = await fetch(`${apiUrl}/forecast`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item_id: itemId, method, periods: 8, params }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Forecast failed')
+      setResult(data)
+      setOverrides({})
+    } catch (e) {
+      setError(e.message || 'Forecast failed')
+      setResult(null)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const finalValues = () => {
+    if (!result) return []
+    return result.forecast.map((f) => {
+      const ov = overrides[f.week]
+      return ov !== undefined && ov !== '' ? Number(ov) : f.forecast
+    })
+  }
+
+  const applyToMrp = async () => {
+    if (!result) return
+    setApplying(true)
+    setError('')
+    try {
+      const res = await fetch(`${apiUrl}/forecast/apply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          item_id: itemId,
+          forecast_values: finalValues(),
+          method,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Apply failed')
+      setToast('Forecast applied — MRP recalculated with new demand plan')
+      await onApplied?.(data)
+      setTimeout(() => onGoPlanning?.(), 900)
+    } catch (e) {
+      setError(e.message || 'Apply failed')
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  const chartData = (() => {
+    if (!result) return []
+    const hist = result.historical.map((h) => ({
+      week: h.week,
+      actual: h.actual,
+      forecast: null,
+      lower: null,
+      upper: null,
+    }))
+    const fc = result.forecast.map((f) => {
+      const ov = overrides[f.week]
+      const final = ov !== undefined && ov !== '' ? Number(ov) : f.forecast
+      return {
+        week: f.week,
+        actual: null,
+        forecast: final,
+        lower: f.lower,
+        upper: f.upper,
+      }
+    })
+    return [...hist, ...fc]
+  })()
+
+  const mapeClass = (m) => (m < 15 ? 'metric-good' : m <= 25 ? 'metric-warn' : 'metric-bad')
+  const biasClass = (b) => (Math.abs(b) <= 2 ? 'metric-good' : Math.abs(b) <= 5 ? 'metric-warn' : 'metric-bad')
+
+  const accuracyBlurb = (acc) => {
+    if (!acc) return ''
+    const quality = acc.mape < 15 ? 'this is good' : acc.mape <= 25 ? 'this is acceptable' : 'consider tuning parameters'
+    const biasNote = acc.bias > 0.5
+      ? 'Slight positive bias means you tend to over-forecast slightly.'
+      : acc.bias < -0.5
+        ? 'Slight negative bias means you tend to under-forecast slightly.'
+        : 'Bias is near zero — forecasts are well centered.'
+    return `Your forecast is ${acc.mape}% off on average — ${quality}. ${biasNote}`
+  }
+
+  if (hasHistory === false) {
+    return (
+      <div className="forecast-page">
+        <div className="card forecast-empty-card">
+          <h3>No historical data found</h3>
+          <p>
+            Add a <strong>Sales_History</strong> sheet to your Excel file with columns:
+            Item_ID, W-1, W-2, W-3 … W-16 (past 16 weeks of actual sales).
+          </p>
+          <p className="muted">Then re-upload the file or load the updated sample data.</p>
+          <button type="button" className="btn-primary" onClick={onUpload}>
+            Go to Upload
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="forecast-page">
+      {toast && <div className="forecast-toast">{toast}</div>}
+      {error && <p className="error-msg">{error}</p>}
+
+      <div className="forecast-top-grid">
+        <div className="card">
+          <div className="card-header">
+            <h3>Select Item</h3>
+            <p>Finished goods only — forecasts feed MRP demand</p>
+          </div>
+          <select
+            className="forecast-item-select"
+            value={itemId}
+            onChange={(e) => {
+              setItemId(e.target.value)
+              setResult(null)
+              setOverrides({})
+            }}
+          >
+            {finishedGoods.length === 0 && <option value="">No finished goods</option>}
+            {finishedGoods.map((i) => (
+              <option key={i.item_id} value={i.item_id}>
+                {i.item_name} ({i.item_id})
+              </option>
+            ))}
+          </select>
+          {selected && (
+            <div className="forecast-item-meta">
+              <span className={`category-badge ${getCategoryBadgeClass(getItemCategory(selected))}`}>
+                {getItemCategory(selected)}
+              </span>
+              <span className="muted">
+                Current W1–W8 demand: {currentDemand.join(', ')}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <h3>Forecasting Method</h3>
+            <p>Choose a statistical method, then generate</p>
+          </div>
+          <div className="forecast-method-grid">
+            {methods.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                className={`forecast-method-card${method === m.id ? ' selected' : ''}`}
+                onClick={() => setMethod(m.id)}
+              >
+                <strong>{m.title}</strong>
+                <span>{m.best}</span>
+                <span className="muted">{m.sap}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="forecast-params">
+            {method === 'moving_average' && (
+              <label>
+                Window: {params.ma_window} weeks
+                <input
+                  type="range" min="2" max="8" value={params.ma_window}
+                  onChange={(e) => setParams({ ...params, ma_window: Number(e.target.value) })}
+                />
+              </label>
+            )}
+            {(method === 'exponential_smoothing' || method === 'double_exponential' || method === 'holt_winters') && (
+              <label>
+                Alpha (smoothing): {params.alpha.toFixed(1)}
+                <input
+                  type="range" min="0.1" max="0.9" step="0.1" value={params.alpha}
+                  onChange={(e) => setParams({ ...params, alpha: Number(e.target.value) })}
+                />
+                <span className="muted">Higher = more weight on recent data</span>
+              </label>
+            )}
+            {method === 'double_exponential' && (
+              <label>
+                Beta (trend): {params.beta.toFixed(1)}
+                <input
+                  type="range" min="0.1" max="0.9" step="0.1" value={params.beta}
+                  onChange={(e) => setParams({ ...params, beta: Number(e.target.value) })}
+                />
+              </label>
+            )}
+            {method === 'holt_winters' && (
+              <label>
+                Seasonal periods
+                <select
+                  value={params.seasonal_periods}
+                  onChange={(e) => setParams({ ...params, seasonal_periods: Number(e.target.value) })}
+                >
+                  <option value={4}>4 (quarterly pattern)</option>
+                  <option value={12}>12 (monthly pattern)</option>
+                </select>
+              </label>
+            )}
+          </div>
+
+          <button type="button" className="btn-primary" onClick={generate} disabled={loading || !itemId}>
+            {loading ? 'Generating…' : 'Generate Forecast'}
+          </button>
+        </div>
+      </div>
+
+      {result && (
+        <>
+          <div className="card">
+            <div className="card-header">
+              <h3>Historical vs Forecast — {result.item_name}</h3>
+              <p><span className="muted">Historical</span> · <span style={{ color: '#0071e3' }}>Forecast</span></p>
+            </div>
+            <ResponsiveContainer width="100%" height={320}>
+              <ComposedChart data={chartData}>
+                <CartesianGrid {...CHART_GRID} />
+                <XAxis dataKey="week" {...AXIS_STYLE} interval="preserveStartEnd" />
+                <YAxis {...AXIS_STYLE} />
+                <Tooltip />
+                <Legend />
+                <Area type="monotone" dataKey="upper" stroke="none" fill="#0071e3" fillOpacity={0.08} name="Upper bound" />
+                <Area type="monotone" dataKey="lower" stroke="none" fill="#fff" fillOpacity={1} name="Lower bound" />
+                <Line type="monotone" dataKey="actual" stroke="#86868b" strokeWidth={2} dot={false} name="Historical" connectNulls={false} />
+                <Line type="monotone" dataKey="forecast" stroke="#0071e3" strokeWidth={2.5} dot={{ r: 3 }} name="Forecast" connectNulls={false} />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="forecast-metrics-row">
+            <div className={`card forecast-metric ${mapeClass(result.accuracy.mape)}`}>
+              <span className="forecast-metric-label">MAPE</span>
+              <strong>{result.accuracy.mape}%</strong>
+              <span className="muted">Mean Abs % Error</span>
+            </div>
+            <div className="card forecast-metric">
+              <span className="forecast-metric-label">MAD</span>
+              <strong>{result.accuracy.mad} units</strong>
+              <span className="muted">Mean Abs Deviation</span>
+            </div>
+            <div className={`card forecast-metric ${biasClass(result.accuracy.bias)}`}>
+              <span className="forecast-metric-label">Bias</span>
+              <strong>{result.accuracy.bias > 0 ? '+' : ''}{result.accuracy.bias}</strong>
+              <span className="muted">Over/Under forecast</span>
+            </div>
+          </div>
+          <p className="forecast-blurb">{accuracyBlurb(result.accuracy)}</p>
+
+          <div className="card table-card">
+            <div className="card-header">
+              <h3>Forecast table</h3>
+              <p>Edit Override to adjust before applying to MRP</p>
+            </div>
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Week</th>
+                    <th>Statistical Forecast</th>
+                    <th>Your Override</th>
+                    <th>Final Forecast</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.forecast.map((f) => {
+                    const ov = overrides[f.week]
+                    const hasOv = ov !== undefined && ov !== ''
+                    const final = hasOv ? Number(ov) : f.forecast
+                    return (
+                      <tr key={f.week}>
+                        <td>{weekLabel(f.week)}</td>
+                        <td>{f.forecast}</td>
+                        <td>
+                          <input
+                            className={`forecast-override-input${hasOv ? ' overridden' : ''}`}
+                            type="number"
+                            placeholder="—"
+                            value={hasOv ? ov : ''}
+                            onChange={(e) => {
+                              const v = e.target.value
+                              setOverrides((prev) => {
+                                const next = { ...prev }
+                                if (v === '') delete next[f.week]
+                                else next[f.week] = v
+                                return next
+                              })
+                            }}
+                          />
+                        </td>
+                        <td className={hasOv ? 'cell-override' : ''}>{final}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="forecast-actions">
+            <button type="button" className="btn-primary" onClick={applyToMrp} disabled={applying}>
+              {applying ? 'Applying…' : 'Apply to MRP'}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => setOverrides({})}
+              disabled={Object.keys(overrides).length === 0}
+            >
+              Reset to Statistical
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function OverviewPage({ summary, mrpResults, items, openPos, hasData, onUpload, selectedItemId, onOpenDrilldown, lastUpdated, filename, forecastStatus, onDismissForecastBanner }) {
   if (!hasData) return <EmptyState onUpload={onUpload} />
 
   const filteredMrp = filterByItem(mrpResults, selectedItemId)
@@ -1683,6 +2220,18 @@ function OverviewPage({ summary, mrpResults, items, openPos, hasData, onUpload, 
 
   return (
     <div className="overview-page">
+      {forecastStatus?.forecast_active && !forecastStatus?.bannerDismissed && (
+        <div className="forecast-applied-banner">
+          <span>
+            Using AI forecast — demand plan generated by{' '}
+            <strong>{(forecastStatus.method || 'forecast').replace(/_/g, ' ')}</strong> forecasting
+            {forecastStatus.applied_at ? ` • Applied ${timeAgo(forecastStatus.applied_at)}` : ''}
+          </span>
+          <button type="button" className="forecast-banner-dismiss" onClick={onDismissForecastBanner} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      )}
       <div className="overview-hero">
         <div className="overview-hero-content">
           <h2>Supply Chain Status</h2>
@@ -2346,7 +2895,9 @@ function ExportDataSection({ apiUrl, hasData }) {
 
 function PipelineFlowDiagram() {
   const mainSteps = [
-    { icon: '📄', label: 'Excel/ERP' },
+    { icon: '📈', label: 'Sales History' },
+    { icon: '🔮', label: 'Forecasting Engine' },
+    { icon: '📋', label: 'Demand Plan' },
     { icon: '🐍', label: 'Python MRP Engine' },
     { icon: '🗄️', label: 'SQLite' },
     { icon: '🤖', label: 'AI Dashboard' },
@@ -2625,6 +3176,7 @@ function AboutPage() {
 
 const PAGE_TITLES = {
   upload: { title: 'Upload', subtitle: 'Import or sync your planning data' },
+  forecast: { title: 'Demand Forecasting', subtitle: 'Generate statistical forecasts from historical sales data' },
   overview: { title: 'Overview', subtitle: 'Your supply plan at a glance' },
   planning: { title: 'Planning View', subtitle: 'Weekly requirements and release schedule' },
   'purchase-orders': { title: 'Purchase Orders', subtitle: 'Incoming supply from suppliers' },
@@ -2649,12 +3201,13 @@ export default function App() {
   const [drilldown, setDrilldown] = useState(null)
   const [apiError, setApiError] = useState('')
   const [sessionActive, setSessionActive] = useState(false)
+  const [forecastStatus, setForecastStatus] = useState({ has_sales_history: false, forecast_active: false })
   const loadedTimestampRef = useRef(null)
   const suppressPollUntilRef = useRef(0)
 
   const selectedItem = getSelectedItem(items, selectedItemId)
 
-  const apiUrl = 'http://localhost:8000'
+  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
   const clearLocalData = useCallback(() => {
     setHasData(false)
@@ -2737,6 +3290,16 @@ export default function App() {
     } catch { /* offline */ }
   }, [apiUrl, fetchAll])
 
+  const refreshForecastStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${apiUrl}/forecast/status`)
+      if (res.ok) {
+        const data = await res.json()
+        setForecastStatus((prev) => ({ ...prev, ...data }))
+      }
+    } catch { /* ignore */ }
+  }, [apiUrl])
+
   useEffect(() => {
     fetchAll().then(async (has) => {
       if (!has) {
@@ -2751,8 +3314,9 @@ export default function App() {
           setLastUpdated(data.last_updated)
         }
       } catch { /* ignore */ }
+      refreshForecastStatus()
     })
-  }, [fetchAll, apiUrl])
+  }, [fetchAll, apiUrl, refreshForecastStatus])
 
   useEffect(() => {
     if (!sessionActive) return undefined
@@ -2822,6 +3386,7 @@ export default function App() {
     }
     const data = await res.json()
     await handleUploadSuccess(data)
+    await refreshForecastStatus()
   }
 
   const handleItemChange = (itemId) => {
@@ -2857,6 +3422,11 @@ export default function App() {
             >
               <NavIcon type={item.icon} />
               <span className="nav-label">{item.label}</span>
+              {item.id === 'forecast' && hasData && (
+                <span className={`nav-badge ${forecastStatus.forecast_active ? 'nav-badge-active' : 'nav-badge-setup'}`}>
+                  {forecastStatus.forecast_active ? 'Active' : 'Setup'}
+                </span>
+              )}
             </button>
           ))}
         </nav>
@@ -2892,6 +3462,21 @@ export default function App() {
               onLoadSample={handleLoadSample}
             />
           )}
+          {page === 'forecast' && (
+            <ForecastPage
+              apiUrl={apiUrl}
+              items={items}
+              mrpResults={mrpResults}
+              hasData={hasData}
+              onUpload={goUpload}
+              forecastStatus={forecastStatus}
+              onApplied={async () => {
+                await fetchAll()
+                await refreshForecastStatus()
+              }}
+              onGoPlanning={() => setPage('planning')}
+            />
+          )}
           {page === 'overview' && (
             <OverviewPage
               summary={summary}
@@ -2904,6 +3489,8 @@ export default function App() {
               onOpenDrilldown={openDrilldown}
               lastUpdated={lastUpdated}
               filename={syncStatus?.filename}
+              forecastStatus={forecastStatus}
+              onDismissForecastBanner={() => setForecastStatus((s) => ({ ...s, bannerDismissed: true }))}
             />
           )}
           {page === 'planning' && (
