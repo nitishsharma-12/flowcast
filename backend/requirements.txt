@@ -10,3 +10,5 @@ numpy
 httpx
 watchdog
 psycopg2-binary
+requests
+pytrends

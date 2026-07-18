@@ -31,6 +31,13 @@ from forecast_engine import (
     forecast_with_method,
     holdout_accuracy,
 )
+from risk_intelligence import (
+    DEFAULT_MANUFACTURING_HUBS,
+    combine_risk,
+    fetch_economic,
+    fetch_news,
+    fetch_weather,
+)
 from database import (
     DB_TYPE,
     DATABASE_URL,
@@ -52,6 +59,8 @@ from database import (
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WATCHED_DIR = os.path.join(BASE_DIR, "watched_files")
@@ -73,6 +82,7 @@ watch_state = {
 # intentional load (upload / load-sample / live file drop) during this session.
 session_state = {"active": False}
 last_excel_content: Optional[bytes] = None
+risk_summary_cache: Optional[dict] = None
 
 SAMPLE_FILE_PATH = os.path.join(BASE_DIR, "sample_mrp_data.xlsx")
 MRP_DB_PATH = os.path.join(BASE_DIR, "mrp.db")
@@ -182,6 +192,11 @@ class ForecastOverrideRequest(BaseModel):
     item_id: str
     week: str
     value: float
+
+
+class RiskAdjustmentRequest(BaseModel):
+    item_id: str
+    adjustment_pct: float
 
 
 def week_index(week: str) -> int:
@@ -1321,6 +1336,167 @@ def get_sales_history(item_id: Optional[str] = None):
         db.close()
 
 
+@app.get("/risk/weather")
+def get_weather_risk():
+    # The current item schema has supplier names but no coordinates. Keep the
+    # default hubs until uploaded item/supplier locations become available.
+    return fetch_weather(DEFAULT_MANUFACTURING_HUBS)
+
+
+@app.get("/risk/economic")
+def get_economic_risk():
+    return fetch_economic(FRED_API_KEY)
+
+
+@app.get("/risk/news")
+def get_news_risk():
+    return fetch_news(NEWS_API_KEY)
+
+
+@app.get("/risk/summary")
+def get_risk_summary():
+    global risk_summary_cache
+    weather = fetch_weather(DEFAULT_MANUFACTURING_HUBS)
+    economic = fetch_economic(FRED_API_KEY)
+    news = fetch_news(NEWS_API_KEY)
+    risk_summary_cache = combine_risk(weather, economic, news)
+    return risk_summary_cache
+
+
+@app.post("/risk/apply-adjustment")
+def apply_risk_adjustment(req: RiskAdjustmentRequest):
+    global last_excel_content, sync_state
+
+    adjustment_pct = max(-30.0, min(30.0, float(req.adjustment_pct)))
+    item_id = str(req.item_id).strip()
+    db = SessionLocal()
+    try:
+        item = db.query(Item).filter(Item.item_id == item_id).first()
+        if not item:
+            raise HTTPException(status_code=404, detail=f"Item {item_id} not found")
+
+        latest = (
+            db.query(ForecastMeta)
+            .filter(ForecastMeta.item_id == item_id)
+            .order_by(ForecastMeta.id.desc())
+            .first()
+        )
+        original_values = None
+        if latest:
+            try:
+                metadata = json.loads(latest.overrides_json or "{}")
+                if latest.method == "risk_adjusted" and metadata.get("original_forecast"):
+                    original_values = metadata["original_forecast"]
+                elif latest.forecast_json:
+                    original_values = json.loads(latest.forecast_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                original_values = None
+
+        if not original_values:
+            rows = (
+                db.query(MRPResult)
+                .filter(MRPResult.item_id == item_id)
+                .all()
+            )
+            by_week = {row.week: row.gross_req for row in rows}
+            original_values = [float(by_week.get(week, 0) or 0) for week in WEEKS]
+    finally:
+        db.close()
+
+    values = [max(0.0, round(float(value) * (1 + adjustment_pct / 100), 2)) for value in original_values]
+    while len(values) < 8:
+        values.append(values[-1] if values else 0.0)
+    values = values[:8]
+    original_values = [round(float(value), 2) for value in original_values[:8]]
+
+    content = last_excel_content
+    if not content:
+        try:
+            content = _get_source_excel_bytes()
+        except HTTPException:
+            raise HTTPException(status_code=400, detail="No source Excel available to re-run MRP")
+
+    parsed = parse_excel(content)
+    demand = parsed["demand_forecast"].copy()
+    if "Item_ID" not in demand.columns:
+        raise HTTPException(status_code=400, detail="Demand forecast sheet missing Item_ID")
+
+    mask = demand["Item_ID"].astype(str).str.strip() == item_id
+    if not mask.any():
+        new_row = {"Item_ID": item_id, **{week: values[index] for index, week in enumerate(WEEKS)}}
+        demand = pd.concat([demand, pd.DataFrame([new_row])], ignore_index=True)
+    else:
+        for index, week in enumerate(WEEKS):
+            if week not in demand.columns:
+                demand[week] = 0.0
+            demand.loc[mask, week] = values[index]
+
+    parsed["demand_forecast"] = demand
+    result = run_mrp_parsed(parsed)
+    clear_and_store(result)
+    last_excel_content = content
+
+    applied_at = datetime.now(timezone.utc).isoformat()
+    cached_components = (risk_summary_cache or {}).get("components", {})
+    db = SessionLocal()
+    try:
+        db.query(ForecastMeta).update({ForecastMeta.active: 0})
+        db.add(
+            ForecastMeta(
+                item_id=item_id,
+                method="risk_adjusted",
+                applied_at=applied_at,
+                mape=None,
+                mad=None,
+                bias=None,
+                forecast_json=json.dumps(values),
+                overrides_json=json.dumps(
+                    {
+                        "risk_adjustment_pct": adjustment_pct,
+                        "original_forecast": original_values,
+                        "components": cached_components,
+                    }
+                ),
+                active=1,
+            )
+        )
+        db.commit()
+        mrp_rows = (
+            db.query(MRPResult)
+            .filter(MRPResult.item_id == item_id)
+            .order_by(MRPResult.week)
+            .all()
+        )
+        sync_state["last_updated"] = applied_at
+        sync_state["filename"] = sync_state.get("filename") or "risk_adjusted_forecast.xlsx"
+        return {
+            "status": "success",
+            "message": "Forecast adjusted for risk signals — MRP recalculated",
+            "item_id": item_id,
+            "adjustment_pct": adjustment_pct,
+            "applied_at": applied_at,
+            "original_forecast": original_values,
+            "adjusted_forecast": values,
+            "components": cached_components,
+            "mrp_results": [
+                {
+                    "week": row.week,
+                    "gross_req": row.gross_req,
+                    "planned_order": row.planned_order,
+                    "projected_inventory": row.projected_inventory,
+                    "net_req": row.net_req,
+                    "stockout_risk": row.stockout_risk,
+                }
+                for row in mrp_rows
+            ],
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 @app.get("/forecast/status")
 def get_forecast_status():
     db = SessionLocal()
@@ -1332,12 +1508,21 @@ def get_forecast_status():
             .order_by(ForecastMeta.id.desc())
             .first()
         )
+        risk_metadata = {}
+        if active and active.method == "risk_adjusted":
+            try:
+                risk_metadata = json.loads(active.overrides_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                risk_metadata = {}
         return {
             "has_sales_history": has_history,
             "forecast_active": bool(active),
             "method": active.method if active else None,
             "item_id": active.item_id if active else None,
             "applied_at": active.applied_at if active else None,
+            "risk_adjustment_active": bool(active and active.method == "risk_adjusted"),
+            "risk_adjustment_pct": risk_metadata.get("risk_adjustment_pct"),
+            "risk_components": risk_metadata.get("components", {}),
         }
     finally:
         db.close()

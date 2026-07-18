@@ -1786,6 +1786,163 @@ function SupplyCoverageHeatmap({ coverage, itemMap }) {
   )
 }
 
+function RiskBadge({ level }) {
+  const normalized = (level || 'NONE').toUpperCase()
+  return <span className={`risk-level-badge risk-${normalized.toLowerCase()}`}>{normalized}</span>
+}
+
+function RiskCardSkeleton() {
+  return (
+    <div className="risk-card card" aria-label="Loading risk signal">
+      <div className="risk-skeleton risk-skeleton-title" />
+      <div className="risk-skeleton" />
+      <div className="risk-skeleton" />
+      <div className="risk-skeleton risk-skeleton-short" />
+    </div>
+  )
+}
+
+function RiskIntelligencePanel({
+  summary,
+  loading,
+  applying,
+  itemId,
+  onRefresh,
+  onApply,
+}) {
+  const weather = summary?.weather
+  const economic = summary?.economic
+  const news = summary?.news
+  const components = summary?.components || { weather: 0, economic: 0, news: 0 }
+  const total = summary?.total_adjustment || 0
+  const signed = (value) => `${value > 0 ? '+' : ''}${value}%`
+  const signalClass = economic?.signal?.toLowerCase() || 'neutral'
+
+  return (
+    <section className="risk-intelligence">
+      <div className="risk-panel-header">
+        <div>
+          <h2>Risk Intelligence</h2>
+          <p>Live external signals affecting your forecast</p>
+        </div>
+        <div className="risk-refresh-wrap">
+          {summary?.updated_at && <span>Updated {timeAgo(summary.updated_at)}</span>}
+          <button type="button" className="btn-secondary" onClick={onRefresh} disabled={loading}>
+            {loading ? 'Refreshing…' : 'Refresh signals'}
+          </button>
+        </div>
+      </div>
+
+      <div className="risk-card-grid">
+        {loading && !summary ? (
+          <>
+            <RiskCardSkeleton />
+            <RiskCardSkeleton />
+            <RiskCardSkeleton />
+          </>
+        ) : (
+          <>
+            <div className="risk-card card">
+              <div className="risk-card-title">
+                <span className="risk-card-icon" aria-hidden="true">☁</span>
+                <h3>Weather Risk</h3>
+                <RiskBadge level={weather?.overall_risk} />
+              </div>
+              <div className="risk-card-list">
+                {(weather?.locations || []).slice(0, 3).map((location) => (
+                  <div className="risk-weather-row" key={location.name}>
+                    <span aria-hidden="true">🇺🇸</span>
+                    <div>
+                      <strong>{location.name}</strong>
+                      <span>{location.description}</span>
+                    </div>
+                    <RiskBadge level={location.risk_level} />
+                  </div>
+                ))}
+                {!weather?.locations?.length && <p className="risk-empty">Weather signal unavailable</p>}
+              </div>
+              {weather?.warning && <p className="risk-warning">{weather.warning}</p>}
+              <div className="risk-card-footer">Recommended buffer: <strong>+{weather?.recommended_buffer || 0}%</strong></div>
+            </div>
+
+            <div className="risk-card card">
+              <div className="risk-card-title">
+                <span className="risk-card-icon" aria-hidden="true">
+                  {economic?.signal === 'BEARISH' ? '↘' : '↗'}
+                </span>
+                <h3>Economic Indicators</h3>
+                <span className={`economic-signal signal-${signalClass}`}>{economic?.signal || 'NEUTRAL'}</span>
+              </div>
+              <div className="risk-card-list">
+                {(economic?.indicators || []).map((indicator) => {
+                  const positive = indicator.change > 0
+                  return (
+                    <div className={`risk-economic-row ${positive ? 'positive' : indicator.change < 0 ? 'negative' : ''}`} key={indicator.series_id}>
+                      <span className="risk-trend-arrow">{positive ? '↑' : indicator.change < 0 ? '↓' : '→'}</span>
+                      <div>
+                        <strong>{indicator.name}</strong>
+                        <span>{indicator.current_value} ({indicator.change > 0 ? '+' : ''}{indicator.change})</span>
+                      </div>
+                    </div>
+                  )
+                })}
+                {!economic?.indicators?.length && <p className="risk-empty">Add a FRED key to load indicators</p>}
+              </div>
+              {economic?.warning && <p className="risk-warning">{economic.warning}</p>}
+              <div className="risk-card-footer">Demand adjustment: <strong>{signed(economic?.overall_demand_adjustment || 0)}</strong></div>
+            </div>
+
+            <div className="risk-card card">
+              <div className="risk-card-title">
+                <span className="risk-card-icon" aria-hidden="true">▤</span>
+                <h3>News Alerts</h3>
+                <RiskBadge level={news?.overall_risk} />
+              </div>
+              <p className="risk-news-count">{news?.total_articles || 0} disruption signals found</p>
+              <div className="risk-card-list">
+                {(news?.articles || []).slice(0, 3).map((article) => (
+                  <a className="risk-news-row" href={article.url} target="_blank" rel="noreferrer" key={article.url}>
+                    <RiskBadge level={article.risk_level} />
+                    <div>
+                      <strong>{article.title.length > 60 ? `${article.title.slice(0, 57)}…` : article.title}</strong>
+                      <span>{article.source}{article.published_at ? ` · ${timeAgo(article.published_at)}` : ''}</span>
+                    </div>
+                  </a>
+                ))}
+                {!news?.articles?.length && <p className="risk-empty">Add a NewsAPI key to load alerts</p>}
+              </div>
+              {news?.warning && <p className="risk-warning">{news.warning}</p>}
+              <div className="risk-card-footer">Recommended buffer: <strong>+{news?.recommended_buffer || 0}%</strong></div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {!loading && summary && (
+        <div className={`risk-impact-banner ${total > 0 ? 'risk-impact-positive' : total < 0 ? 'risk-impact-negative' : 'risk-impact-clear'}`}>
+          <div>
+            <strong>
+              {total > 0 && `⚠️ Risk signals suggest increasing forecast by ${signed(total)}`}
+              {total < 0 && `📉 Economic signals suggest decreasing forecast by ${signed(total)}`}
+              {total === 0 && '✅ No significant risk signals detected — proceed with statistical forecast'}
+            </strong>
+            {total !== 0 && (
+              <span>
+                Weather: {signed(components.weather || 0)} · Economic: {signed(components.economic || 0)} · News: {signed(components.news || 0)}
+              </span>
+            )}
+          </div>
+          {total !== 0 && (
+            <button type="button" className="btn-primary" onClick={onApply} disabled={applying || !itemId}>
+              {applying ? 'Applying…' : `Apply ${signed(total)} to forecast`}
+            </button>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
 function ForecastPage({
   apiUrl,
   items,
@@ -1795,6 +1952,9 @@ function ForecastPage({
   onApplied,
   onGoPlanning,
   forecastStatus,
+  riskSummary,
+  riskLoading,
+  onRefreshRisk,
 }) {
   const finishedGoods = items.filter((i) => getItemCategory(i) === 'Finished Good')
   const [itemId, setItemId] = useState(finishedGoods[0]?.item_id || '')
@@ -1814,6 +1974,8 @@ function ForecastPage({
   const [error, setError] = useState('')
   const [toast, setToast] = useState('')
   const [hasHistory, setHasHistory] = useState(forecastStatus?.has_sales_history ?? null)
+  const [riskApplying, setRiskApplying] = useState(false)
+  const [riskApplied, setRiskApplied] = useState(null)
 
   useEffect(() => {
     if (!itemId && finishedGoods[0]) setItemId(finishedGoods[0].item_id)
@@ -1925,16 +2087,18 @@ function ForecastPage({
       week: h.week,
       actual: h.actual,
       forecast: null,
+      originalForecast: null,
       lower: null,
       upper: null,
     }))
-    const fc = result.forecast.map((f) => {
+    const fc = result.forecast.map((f, index) => {
       const ov = overrides[f.week]
       const final = ov !== undefined && ov !== '' ? Number(ov) : f.forecast
       return {
         week: f.week,
         actual: null,
-        forecast: final,
+        forecast: riskApplied?.adjusted?.[index] ?? final,
+        originalForecast: riskApplied?.original?.[index] ?? null,
         lower: f.lower,
         upper: f.upper,
       }
@@ -1992,6 +2156,7 @@ function ForecastPage({
               setItemId(e.target.value)
               setResult(null)
               setOverrides({})
+              setRiskApplied(null)
             }}
           >
             {finishedGoods.length === 0 && <option value="">No finished goods</option>}
@@ -2082,12 +2247,53 @@ function ForecastPage({
         </div>
       </div>
 
+      <RiskIntelligencePanel
+        summary={riskSummary}
+        loading={riskLoading}
+        applying={riskApplying}
+        itemId={itemId}
+        onRefresh={onRefreshRisk}
+        onApply={async () => {
+          if (!itemId || !riskSummary?.total_adjustment) return
+          setRiskApplying(true)
+          setError('')
+          try {
+            const res = await fetch(`${apiUrl}/risk/apply-adjustment`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                item_id: itemId,
+                adjustment_pct: riskSummary.total_adjustment,
+              }),
+            })
+            const data = await res.json()
+            if (!res.ok) throw new Error(data.detail || 'Risk adjustment failed')
+            setRiskApplied({
+              pct: data.adjustment_pct,
+              original: data.original_forecast,
+              adjusted: data.adjusted_forecast,
+            })
+            setToast('Forecast adjusted for risk signals — MRP recalculated')
+            await onApplied?.(data)
+          } catch (e) {
+            setError(e.message || 'Risk adjustment failed')
+          } finally {
+            setRiskApplying(false)
+          }
+        }}
+      />
+
       {result && (
         <>
           <div className="card">
             <div className="card-header">
               <h3>Historical vs Forecast — {result.item_name}</h3>
-              <p><span className="muted">Historical</span> · <span style={{ color: '#0071e3' }}>Forecast</span></p>
+              <p>
+                <span className="muted">Historical</span> ·{' '}
+                <span style={{ color: '#0071e3' }}>
+                  {riskApplied ? `Risk-adjusted forecast (${riskApplied.pct > 0 ? '+' : ''}${riskApplied.pct}%)` : 'Forecast'}
+                </span>
+              </p>
             </div>
             <ResponsiveContainer width="100%" height={320}>
               <ComposedChart data={chartData}>
@@ -2099,7 +2305,10 @@ function ForecastPage({
                 <Area type="monotone" dataKey="upper" stroke="none" fill="#0071e3" fillOpacity={0.08} name="Upper bound" />
                 <Area type="monotone" dataKey="lower" stroke="none" fill="#fff" fillOpacity={1} name="Lower bound" />
                 <Line type="monotone" dataKey="actual" stroke="#86868b" strokeWidth={2} dot={false} name="Historical" connectNulls={false} />
-                <Line type="monotone" dataKey="forecast" stroke="#0071e3" strokeWidth={2.5} dot={{ r: 3 }} name="Forecast" connectNulls={false} />
+                {riskApplied && (
+                  <Line type="monotone" dataKey="originalForecast" stroke="#86868b" strokeDasharray="6 5" strokeWidth={2} dot={false} name="Original forecast" connectNulls={false} />
+                )}
+                <Line type="monotone" dataKey="forecast" stroke="#0071e3" strokeWidth={2.5} dot={{ r: 3 }} name={riskApplied ? 'Risk-adjusted forecast' : 'Forecast'} connectNulls={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </div>
@@ -2217,15 +2426,31 @@ function OverviewPage({ summary, mrpResults, items, openPos, hasData, onUpload, 
     lastUpdated ? formatLastUpdated(lastUpdated) : null,
     filename || null,
   ].filter(Boolean).join(' · ')
+  const riskPct = forecastStatus?.risk_adjustment_pct || 0
+  const riskSources = Object.entries(forecastStatus?.risk_components || {})
+    .filter(([, value]) => value !== 0)
+    .map(([name]) => name)
+  const riskSourceLabel = riskSources.length ? riskSources.join(' and ') : 'external risk'
 
   return (
     <div className="overview-page">
-      {forecastStatus?.forecast_active && !forecastStatus?.bannerDismissed && (
+      {forecastStatus?.forecast_active && !forecastStatus?.risk_adjustment_active && !forecastStatus?.bannerDismissed && (
         <div className="forecast-applied-banner">
           <span>
             Using AI forecast — demand plan generated by{' '}
             <strong>{(forecastStatus.method || 'forecast').replace(/_/g, ' ')}</strong> forecasting
             {forecastStatus.applied_at ? ` • Applied ${timeAgo(forecastStatus.applied_at)}` : ''}
+          </span>
+          <button type="button" className="forecast-banner-dismiss" onClick={onDismissForecastBanner} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      )}
+      {forecastStatus?.risk_adjustment_active && !forecastStatus?.bannerDismissed && (
+        <div className="forecast-applied-banner risk-adjusted-active-banner">
+          <span>
+            Risk-adjusted forecast active — <strong>{riskPct > 0 ? '+' : ''}{riskPct}%</strong>{' '}
+            buffer applied based on {riskSourceLabel} signals
           </span>
           <button type="button" className="forecast-banner-dismiss" onClick={onDismissForecastBanner} aria-label="Dismiss">
             ×
@@ -3202,6 +3427,8 @@ export default function App() {
   const [apiError, setApiError] = useState('')
   const [sessionActive, setSessionActive] = useState(false)
   const [forecastStatus, setForecastStatus] = useState({ has_sales_history: false, forecast_active: false })
+  const [riskSummary, setRiskSummary] = useState(null)
+  const [riskLoading, setRiskLoading] = useState(false)
   const loadedTimestampRef = useRef(null)
   const suppressPollUntilRef = useRef(0)
 
@@ -3228,6 +3455,7 @@ export default function App() {
     setOpenPos([])
     setItems([])
     setLastUpdated(null)
+    setRiskSummary(null)
   }, [])
 
   const fetchAll = useCallback(async () => {
@@ -3312,6 +3540,27 @@ export default function App() {
     } catch { /* ignore */ }
   }, [apiUrl])
 
+  const refreshRiskSummary = useCallback(async () => {
+    setRiskLoading(true)
+    try {
+      const res = await fetch(`${apiUrl}/risk/summary`)
+      if (!res.ok) throw new Error(`Risk service returned ${res.status}`)
+      setRiskSummary(await res.json())
+    } catch {
+      setRiskSummary((previous) => previous || {
+        weather: { locations: [], overall_risk: 'NONE', recommended_buffer: 0 },
+        economic: { indicators: [], signal: 'NEUTRAL', overall_demand_adjustment: 0 },
+        news: { articles: [], overall_risk: 'NONE', recommended_buffer: 0, total_articles: 0 },
+        components: { weather: 0, economic: 0, news: 0 },
+        total_adjustment: 0,
+        overall_risk: 'NONE',
+        warnings: ['Risk signals could not be refreshed'],
+      })
+    } finally {
+      setRiskLoading(false)
+    }
+  }, [apiUrl])
+
   useEffect(() => {
     fetchAll().then(async (has) => {
       if (!has) {
@@ -3336,6 +3585,10 @@ export default function App() {
     const id = setInterval(pollForUpdates, 20000)
     return () => clearInterval(id)
   }, [pollForUpdates, sessionActive])
+
+  useEffect(() => {
+    if (sessionActive && hasData && !riskSummary) refreshRiskSummary()
+  }, [hasData, refreshRiskSummary, riskSummary, sessionActive])
 
   const goUpload = () => setPage('upload')
 
@@ -3435,8 +3688,8 @@ export default function App() {
               <NavIcon type={item.icon} />
               <span className="nav-label">{item.label}</span>
               {item.id === 'forecast' && hasData && (
-                <span className={`nav-badge ${forecastStatus.forecast_active ? 'nav-badge-active' : 'nav-badge-setup'}`}>
-                  {forecastStatus.forecast_active ? 'Active' : 'Setup'}
+                <span className={`nav-badge ${riskSummary?.overall_risk === 'HIGH' ? 'nav-badge-risk' : forecastStatus.forecast_active ? 'nav-badge-active' : 'nav-badge-setup'}`}>
+                  {riskSummary?.overall_risk === 'HIGH' ? '⚠ HIGH RISK' : forecastStatus.forecast_active ? 'Active' : 'Setup'}
                 </span>
               )}
             </button>
@@ -3487,6 +3740,9 @@ export default function App() {
                 await refreshForecastStatus()
               }}
               onGoPlanning={() => setPage('planning')}
+              riskSummary={riskSummary}
+              riskLoading={riskLoading}
+              onRefreshRisk={refreshRiskSummary}
             />
           )}
           {page === 'overview' && (
